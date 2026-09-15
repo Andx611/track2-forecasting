@@ -216,3 +216,41 @@ def test_reasoning_cli_uses_log_targets_and_nonzero_return_adjustments(
     assert "1 bp adds 0.0001" in prompts[0]
     metadata = json.loads((output.parent / "forecast_meta.json").read_text())
     assert metadata["reasoning_applied"] is True
+
+
+def test_reasoning_cli_discovers_card_and_uses_harness_seed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    panels, asof = _panels(np.tile([1.0, 2.0], 40))
+    unit = tmp_path / "unit"
+    panel_dir = unit / "panels"
+    panel_dir.mkdir(parents=True)
+    panels["synthetic"].to_parquet(panel_dir / "synthetic.parquet", index=False)
+    (unit / "card.toml").write_text(
+        '[task]\nid = "synthetic"\n[targets]\nasset_ids = ["A"]\n'
+        'horizons = [1]\ntarget_type = "level"\n'
+    )
+    text = unit / "text"
+    text.mkdir()
+    (text / "corpus_index.json").write_text('{"documents": []}')
+    monkeypatch.setenv("QFBENCH_SEED", "23")
+
+    output = tmp_path / "output" / "forecast.parquet"
+    assert (
+        reasoning_agent.main(
+            [
+                "--panels",
+                str(panel_dir),
+                "--text",
+                str(text),
+                "--asof",
+                asof,
+                "--out",
+                str(output),
+            ]
+        )
+        == 0
+    )
+
+    expected, _ = cli._draw(panels, ["A"], [1], asof, 500, 23)
+    np.testing.assert_array_equal(pd.read_parquet(output)["value"], expected[:, 0, 0])

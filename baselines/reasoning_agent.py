@@ -86,11 +86,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime as dt
 import http.client
 import json
 import math
 import os
 import pathlib
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -104,6 +106,7 @@ _TIMEOUT_SEC = 60
 _TRACE_CHARS = 4000
 _MAX_DOC_CHARS = 6000
 _MAX_DOCS = 8
+_GENERIC_RANKING_TERMS = frozenset({"daily"})
 _VOL_CLAMP = (0.5, 2.0)
 #: Ceiling on the drift, expressed in horizon standard deviations rather than in the target's own
 #: units, because Track 2 panels span yields (~4), FX (~1) and factor returns (~0.006) and no
@@ -118,13 +121,70 @@ _RESPONSE_BYTES = 1024 * 1024
 
 
 # --------------------------------------------------------------------------- corpus
-def read_corpus(text_dir: pathlib.Path, asof: str) -> tuple[list[dict[str, Any]], int, int]:
-    """Documents dated at or before `asof`, newest first.
+def _ranking_keywords(assets: list[str], panel_ids: list[str]) -> set[str]:
+    """Mechanical keyword set from target assets and panel identifiers."""
+    keywords: set[str] = set()
+    for label in [*assets, *panel_ids]:
+        keywords.update(
+            token
+            for token in re.findall(r"[a-z0-9]+", str(label).lower())
+            if len(token) > 1 and token not in _GENERIC_RANKING_TERMS
+        )
+    return keywords
+
+
+def rank_documents(
+    docs: list[dict[str, Any]],
+    assets: list[str],
+    panel_ids: list[str],
+    asof: str,
+    max_docs: int,
+) -> list[dict[str, Any]]:
+    """Rank admissible documents by transparent keyword relevance plus recency.
+
+    Score = 2 * unique keyword matches + 1 / (1 + age_days / 30). One keyword match
+    outweighs the full recency component. Timestamp and doc_id provide deterministic tie-breaks.
+    The caller enforces the as-of cutoff before documents reach this function.
+    """
+    if max_docs < 0:
+        raise ValueError("max_docs must be non-negative")
+    keywords = _ranking_keywords(assets, panel_ids)
+    asof_date = dt.date.fromisoformat(asof)
+    ranked: list[dict[str, Any]] = []
+    for doc in docs:
+        searchable = " ".join(
+            str(doc.get(field, "")) for field in ("doc_id", "doc_type", "source", "text")
+        ).lower()
+        matches = sorted(keywords & set(re.findall(r"[a-z0-9]+", searchable)))
+        document_date = dt.date.fromisoformat(str(doc["timestamp"])[:10])
+        age_days = max(0, (asof_date - document_date).days)
+        candidate = dict(doc)
+        candidate["selection_keywords"] = matches
+        candidate["selection_score"] = 2.0 * len(matches) + 1.0 / (1.0 + age_days / 30.0)
+        ranked.append(candidate)
+    ranked.sort(
+        key=lambda doc: (
+            -float(doc["selection_score"]),
+            -dt.date.fromisoformat(str(doc["timestamp"])[:10]).toordinal(),
+            str(doc.get("doc_id", "")),
+        )
+    )
+    return ranked[:max_docs]
+
+
+def read_corpus(
+    text_dir: pathlib.Path,
+    asof: str,
+    assets: list[str] | None = None,
+    panel_ids: list[str] | None = None,
+    max_docs: int = _MAX_DOCS,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Documents dated at or before `asof`, selected for relevance and recency.
 
     Returns `(kept, excluded_by_date, dropped_by_prompt_budget)`. The two counts are reported
     separately because they mean opposite things: the first is the cutoff doing its job, the
-    second is this file's own `_MAX_DOCS` prompt budget throwing away admissible evidence. Nine
-    of the shipped units index more than `_MAX_DOCS` documents, so on those the second count is
+    second is this file's own configurable prompt budget throwing away admissible evidence. Nine
+    of the shipped units index more than the default budget, so on those the second count is
     non-zero and a reader who saw only a single "excluded" number would misread the ledger.
 
     Filtering happens on `corpus_index.json`, which is the organizer's dated manifest. A file on
@@ -155,8 +215,10 @@ def read_corpus(text_dir: pathlib.Path, asof: str) -> tuple[list[dict[str, Any]]
                 "text": path.read_text(encoding="utf-8", errors="replace")[:_MAX_DOC_CHARS],
             }
         )
-    kept.sort(key=lambda d: str(d["timestamp"]), reverse=True)
-    return kept[:_MAX_DOCS], excluded, max(0, len(kept) - _MAX_DOCS)
+    selected = rank_documents(kept, assets or [], panel_ids or [], asof, max_docs)
+    # Preserve the existing prompt contract: selected documents are presented newest first.
+    selected.sort(key=lambda d: (str(d["timestamp"]), str(d.get("doc_id", ""))), reverse=True)
+    return selected, excluded, max(0, len(kept) - max_docs)
 
 
 # --------------------------------------------------------------------------- the model call
@@ -437,18 +499,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--panels", required=True)
     ap.add_argument("--text", required=True)
     ap.add_argument("--asof", required=True)
-    ap.add_argument("--card", required=True)
+    ap.add_argument(
+        "--card",
+        default=None,
+        help="card.toml; defaults to <panels>/../card.toml",
+    )
     ap.add_argument("--out", required=True)
     ap.add_argument("--n-draws", type=int, default=500)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max-docs", type=int, default=_MAX_DOCS)
+    ap.add_argument("--seed", type=int, default=int(os.environ.get("QFBENCH_SEED", "0")))
     a = ap.parse_args(argv)
 
     # The statistical half, imported rather than reimplemented.
     from qfbench2_track_forecasting.cli import _draw, _read_panels
 
-    card = tomllib.loads(pathlib.Path(a.card).read_text(encoding="utf-8"))
+    card_path = pathlib.Path(a.card) if a.card else pathlib.Path(a.panels).parent / "card.toml"
+    if not card_path.is_file():
+        raise SystemExit(f"card.toml not found at {card_path}; pass --card explicitly")
+    card = tomllib.loads(card_path.read_text(encoding="utf-8"))
     t = card["targets"]
     assets, horizons = list(t["asset_ids"]), [int(h) for h in t["horizons"]]
+    panel_ids = [str(x) for x in card.get("panels", {}).get("panel_ids", [])]
     panels = _read_panels(pathlib.Path(a.panels))
     # `_draw` returns (samples, meta); meta already carries the as-of level per asset, so the
     # drift below is expressed against the same number the statistical half used rather than a
@@ -464,7 +535,9 @@ def main(argv: list[str] | None = None) -> int:
     # This is the scale the drift is stated against and clamped on, and it goes in the prompt.
     sd_h = {x: float(draw_meta["daily_sd"][x]) * math.sqrt(max(horizons)) for x in assets}
 
-    docs, excluded, truncated = read_corpus(pathlib.Path(a.text), a.asof)
+    docs, excluded, truncated = read_corpus(
+        pathlib.Path(a.text), a.asof, assets, panel_ids, a.max_docs
+    )
     if not docs:
         parsed, reason, trace = None, "no corpus document is dated at or before the as-of date", ""
     else:
@@ -556,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
                 "",
                 f"- documents read: **{len(docs)}** (dated <= {a.asof})",
                 f"- documents excluded by the cutoff or a missing index entry: **{excluded}**",
-                f"- documents dropped by this file's {_MAX_DOCS}-document prompt budget: "
+                f"- documents dropped by this file's {a.max_docs}-document prompt budget: "
                 f"**{truncated}**",
                 f"- assets named by the reply: **{matched} of {len(assets)}**",
                 f"- adjustment applied: **{reasoning_applied}**",
